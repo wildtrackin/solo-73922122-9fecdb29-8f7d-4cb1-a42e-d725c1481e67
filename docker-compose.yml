@@ -1,0 +1,16 @@
+services:
+  salary-lineage:
+    build: .
+    image: salary-lineage-api:1.0.0
+    container_name: salary-lineage-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    # 本服务只做静态 SQL 解析，不配置任何业务数据库连接
+    environment:
+      PYTHONUNBUFFERED: "1"
