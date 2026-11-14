@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from .models import AnalyzeRequest, SourceColumn, TableMetadata
+from .recon_models import (
+    DepartmentTotal,
+    ReconcileRequest,
+    SalaryRevision,
+)
 
 # --------------------------------------------------------------------------- #
 # 虚构薪酬表结构
@@ -134,3 +139,128 @@ def build_sample_request(kind: str = "nested") -> AnalyzeRequest:
         "incomplete": SAMPLE_SQL_INCOMPLETE,
     }[kind]
     return AnalyzeRequest(sql=sql, tables=SAMPLE_TABLES)
+
+
+# --------------------------------------------------------------------------- #
+# 工资单修订对账样例（金额单位：分）
+# --------------------------------------------------------------------------- #
+#
+# 场景覆盖：
+#   PS-202610-001 同部门金额更正，最终入账 120000；
+#   PS-202610-002 入账后作废，最终不计金额；
+#   PS-202610-003 跨部门更正（D_B -> D_C），两边均按最终状态核对；
+#   PS-202610-004 序号缺口（缺 seq 2），隔离涉及部门 D_B；
+#   PS-202610-005 同序号内容冲突（两条 seq 1 金额不同），隔离 D_C；
+#   PS-202610-006 正常入账，且故意带一条完全相同的重传（去重）；
+#   PS-202610-007 所在部门 D_F 未申报应发总额 -> missing_total；
+#   D_E 只申报总额 0、无任何修订，同样可核对通过。
+#
+def build_sample_reconcile_request() -> ReconcileRequest:
+    revisions = [
+        # 故意乱序提交
+        SalaryRevision(
+            payslip_id="PS-202610-003",
+            revision_no=2,
+            department="D_C",
+            amount_cents=200000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-001",
+            revision_no=1,
+            department="D_A",
+            amount_cents=100000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-005",
+            revision_no=1,
+            department="D_C",
+            amount_cents=70000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-001",
+            revision_no=2,
+            department="D_A",
+            amount_cents=120000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-002",
+            revision_no=2,
+            department="D_A",
+            amount_cents=80000,
+            action="void",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-004",
+            revision_no=1,
+            department="D_B",
+            amount_cents=50000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-003",
+            revision_no=1,
+            department="D_B",
+            amount_cents=200000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-004",
+            revision_no=3,
+            department="D_B",
+            amount_cents=55000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-002",
+            revision_no=1,
+            department="D_A",
+            amount_cents=80000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-006",
+            revision_no=1,
+            department="D_D",
+            amount_cents=90000,
+            action="post",
+        ),
+        # 与上一条完全相同的重传，应被去重
+        SalaryRevision(
+            payslip_id="PS-202610-006",
+            revision_no=1,
+            department="D_D",
+            amount_cents=90000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-005",
+            revision_no=1,
+            department="D_C",
+            amount_cents=75000,
+            action="post",
+        ),
+        SalaryRevision(
+            payslip_id="PS-202610-007",
+            revision_no=1,
+            department="D_F",
+            amount_cents=60000,
+            action="post",
+        ),
+    ]
+    totals = [
+        DepartmentTotal(department="D_A", expected_total_cents=120000),
+        DepartmentTotal(department="D_B", expected_total_cents=250000),
+        DepartmentTotal(department="D_C", expected_total_cents=270000),
+        DepartmentTotal(department="D_D", expected_total_cents=90000),
+        DepartmentTotal(department="D_E", expected_total_cents=0),
+        # D_F 故意不申报汇总
+    ]
+    return ReconcileRequest(
+        pay_month="2026-10",
+        revisions=revisions,
+        department_totals=totals,
+    )

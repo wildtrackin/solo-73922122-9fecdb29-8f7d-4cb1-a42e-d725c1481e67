@@ -1,8 +1,19 @@
-# 薪酬数据字段溯源 API（Salary Column Lineage API）
+# 薪酬数据服务 API（字段溯源 + 工资单修订对账）
+
+本服务包含两个相互独立的能力，均基于 **FastAPI**，**不连接任何业务数据库**：
+
+1. **薪酬数据字段溯源**（FastAPI + sqlglot）：静态分析导出 SQL 依赖了哪些敏感字段；
+2. **工资单修订对账**：月度更正明细入仓前，按工资单修订链重算各部门应发总额并与申报汇总核对，
+   隔离存在序号缺口/内容冲突的工资单，防止冲突工资单被漏算后仍误判对平。
+
+启动后访问 http://localhost:8000/docs ，可在 Swagger UI 中直接操作两类接口。
+
+---
+
+# 一、字段溯源 API
 
 薪酬数据工程师在对外导出部门薪酬数据前，用本服务静态分析导出 SQL 依赖了
-哪些**敏感字段**，从而修改导出逻辑。服务基于 **FastAPI + sqlglot**，
-**不连接任何业务数据库**，只对提交的 SQL 和元数据做静态血缘分析。
+哪些**敏感字段**，从而修改导出逻辑。
 
 ## 能力范围
 
@@ -154,16 +165,153 @@ pip install -r requirements.txt pytest httpx
 pytest -q
 ```
 
+---
+
+# 二、工资单修订对账 API
+
+薪酬数仓工程师在**月度更正明细入仓前**，用本接口核对各部门应发总额，
+确保存在冲突的工资单不会被漏算后仍误判"对平"。所有计算在单次请求内存中完成，
+不落库、无外部依赖。
+
+## 对账规则（关键语义）
+
+1. **条数上限**：单次提交同月最多 **500 条**工资单修订，超出返回 422。
+2. **乱序与去重**：修订可乱序提交；五条字段（工资单号、修订序号、部门、金额、
+   动作）完全相同的重传**只算一次**，响应中通过 `duplicate_revision_count` 披露丢弃条数。
+3. **连续修订确定最终状态**：每张工资单的修订序号必须**从 1 开始且连续**，
+   取最大序号的修订作为最终状态；`void`（作废）不产生金额，`post`（入账）
+   金额计入其最终归属部门。
+4. **序号缺口**：序号未从 1 开始或中间缺号（如只有 1、3）→ 标记 `sequence_gap`。
+5. **同序号内容冲突**：同一工资单同一序号出现不同部门/金额/动作 → 标记
+   `revision_conflict`（完全相同的重传不算冲突）。
+6. **整单隔离**：命中缺口或冲突的工资单，其**历次修订涉及的全部部门**一律
+   隔离（`quarantined`），这些部门**不能用剩余明细放行**，也不输出差额
+   （差额无法确定），响应给出导致隔离的工资单号与原因。
+7. **跨部门更正**：工资单从部门 A 改到部门 B 时，A、B 两边都按**最终状态**
+   核对——A 不再承担该单金额，B 承担最终金额；若最终动作为作废则两边都不计。
+8. **缺少汇总不得放行**：修订中出现、但未申报应发总额的部门标记为
+   `missing_total`，即使重算金额自洽也不放行。
+9. **差额口径**：`variance_cents = 申报应发总额 - 重算应发总额`（单位：分），
+   仅对明细完整的部门输出；隔离或缺汇总部门为 `null`。
+
+## 快速体验
+
+在 Swagger UI（`/docs`）中：
+
+- `GET /api/v1/samples/reconcile/payload` 查看覆盖全部场景的样例请求体；
+- `POST /api/v1/samples/reconcile` 一键运行样例；
+- 或在 `POST /api/v1/payroll/reconcile` 中提交自己的数据。
+
+## 请求格式
+
+`POST /api/v1/payroll/reconcile`
+
+```json
+{
+  "pay_month": "2026-10",
+  "revisions": [
+    {"payslip_id": "PS-001", "revision_no": 1, "department": "D_A", "amount_cents": 100000, "action": "post"},
+    {"payslip_id": "PS-001", "revision_no": 2, "department": "D_B", "amount_cents": 100000, "action": "post"},
+    {"payslip_id": "PS-002", "revision_no": 1, "department": "D_A", "amount_cents": 80000,  "action": "post"},
+    {"payslip_id": "PS-002", "revision_no": 2, "department": "D_A", "amount_cents": 80000,  "action": "void"}
+  ],
+  "department_totals": [
+    {"department": "D_A", "expected_total_cents": 100000},
+    {"department": "D_B", "expected_total_cents": 100000}
+  ]
+}
+```
+
+字段约束：`revision_no >= 1`；`amount_cents` 为非负整数（分）；
+`action` 仅允许 `post` / `void`；`revisions` 至少 1 条、至多 500 条；
+同一部门在 `department_totals` 中重复申报返回 422。
+
+## 响应结构（节选）
+
+```json
+{
+  "pay_month": "2026-10",
+  "revision_count": 4,
+  "raw_revision_count": 4,
+  "duplicate_revision_count": 0,
+  "passed_departments": ["D_A", "D_B"],
+  "warehouse_details": [
+    {"payslip_id": "PS-001", "revision_no": 2, "department": "D_B", "amount_cents": 100000, "action": "post"}
+  ],
+  "departments": [
+    {
+      "department": "D_A",
+      "status": "matched",
+      "computed_total_cents": 100000,
+      "expected_total_cents": 100000,
+      "variance_cents": 0,
+      "reason": null,
+      "detail_count": 1,
+      "quarantined_payslip_ids": []
+    }
+  ],
+  "quarantined_payslips": [],
+  "all_passed": true
+}
+```
+
+### 部门状态（`departments[].status`）
+
+| status | 含义 | 是否放行 |
+| --- | --- | --- |
+| `matched` | 明细完整且重算总额与申报一致（含申报 0、无修订的部门） | 是 |
+| `mismatched` | 明细完整但总额不平，`variance_cents` 给出差额 | 否 |
+| `quarantined` | 关联工资单存在序号缺口/同序号冲突，差额无法确定 | 否 |
+| `missing_total` | 修订涉及该部门但未申报应发总额 | 否 |
+
+### 隔离工资单（`quarantined_payslips[]`）
+
+```json
+{
+  "payslip_id": "PS-004",
+  "reasons": ["sequence_gap"],
+  "affected_departments": ["D_A", "D_B"],
+  "observed_revision_nos": [1, 3]
+}
+```
+
+- `reasons` 可同时包含 `sequence_gap` 与 `revision_conflict`；
+- `affected_departments` 是该单**历次修订出现过的全部部门**，均被隔离；
+- `warehouse_details` 只包含**核对通过部门**的最终入账单（作废单与隔离/缺汇总部门的明细均不入仓）。
+
+### 内置样例覆盖的场景
+
+`build_sample_reconcile_request`（见 `app/samples.py`）一次覆盖：
+同部门金额更正、入账后作废、跨部门更正、序号缺口隔离、同序号冲突隔离、
+完全相同重传去重、缺少汇总部门、零汇总无修订部门。
+
 ## 目录结构
 
 ```
 app/
-  main.py        FastAPI 路由
-  analyzer.py    sqlglot 列级血缘分析器（作用域/三态传播/问题定位）
-  models.py      Pydantic 请求响应模型
-  samples.py     虚构薪酬表结构与样例 SQL
-tests/           分析器与 API 测试（48 个用例）
+  main.py          FastAPI 路由（溯源 + 对账 + 样例）
+  analyzer.py      sqlglot 列级血缘分析器（作用域/三态传播/问题定位）
+  models.py        溯源请求/响应 Pydantic 模型
+  recon_models.py  对账请求/响应 Pydantic 模型（含 500 条上限等约束）
+  reconcile.py     对账引擎（去重/连续修订/缺口冲突隔离/跨部门/差额）
+  samples.py       虚构薪酬表结构、溯源样例 SQL、对账样例请求
+tests/             分析器、对账引擎与 API 测试（80+ 用例）
 Dockerfile
 docker-compose.yml
 requirements.txt
+```
+
+## Docker Compose 启动
+
+```bash
+docker compose up --build
+# 打开浏览器访问
+#   http://localhost:8000/docs
+```
+
+本地无 Docker 时：
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
